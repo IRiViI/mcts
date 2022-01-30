@@ -9,6 +9,7 @@ setuptools.setup(
     author="Rick Vink",
     author_email="rckvnk@gmail.com",
     description="MCTS, including policy value driven mcts",
+    url="https://github.com/IRiViI/mcts",
     long_description=long_description,
     long_description_content_type="text/markdown",
     packages=setuptools.find_packages(),
