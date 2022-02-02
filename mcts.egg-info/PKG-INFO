@@ -1,0 +1,27 @@
+Metadata-Version: 2.1
+Name: mcts
+Version: 1.0.0
+Summary: MCTS, including policy value driven mcts
+Home-page: https://github.com/IRiViI/mcts
+Author: Rick Vink
+Author-email: rckvnk@gmail.com
+License: UNKNOWN
+Description: # mcts
+        
+        
+        # Citations
+        Based on the MCTS used in the Alpha Go Zero
+        @inproceedings{silver2017alphagozero,
+          author={Silver, D., Schrittwieser, J., Simonyan, K. et al.},
+          booktitle={Mastering the game of Go without human knowledge},
+          pages={354–359},
+          year={2017},
+          doi = {https://doi.org/10.1038/nature24270}
+        }
+Keywords: mcts,policy,value
+Platform: UNKNOWN
+Classifier: Programming Language :: Python :: 3
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Operating System :: OS Independent
+Requires-Python: >=3.6
+Description-Content-Type: text/markdown
