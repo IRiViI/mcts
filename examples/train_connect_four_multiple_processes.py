@@ -1,11 +1,14 @@
 import numpy as np
 import os
 from connect_n import ConnectN
-from mcts import PolicyValueNode, PolicyValueTree, visualize_mcts_tree
+from mcts.nodes import PolicyValueNode
+from mcts.trees import PolicyValueTree, visualize_mcts_tree
 import tensorflow as tf
-from tensorflow.keras.layers import Dense, Flatten, Input, concatenate, Conv2D, Embedding
-from tensorflow.keras.models import Model
-import multiprocessing as mp
+import torch
+from torch import nn
+# import multiprocessing as mp
+from torch import multiprocessing as mp
+import torch.nn.functional as F
 import time
 import pickle
 from scipy.special import softmax
@@ -18,7 +21,7 @@ class MCTSSessionProcess(mp.Process):
         shared_values=None, shared_policies=None,
         **kwargs):
         super(MCTSSessionProcess, self).__init__(**kwargs)
-        self.seed = np.random.randint(1e7)
+        self.seed = np.random.randint(int(1e7))
         self.n_descent = n_descent
         self.number_of_players = number_of_players
         self.request_queue = mp.Queue()
@@ -44,6 +47,8 @@ class MCTSSessionProcess(mp.Process):
 
         # Start a new game
         game = ConnectN(size=size)
+
+        number_of_actions = len(game.get_legal_actions())
 
         game_history = {
             "accumulated_policies": [],
@@ -133,7 +138,7 @@ class MCTSSessionProcess(mp.Process):
                 # Create a new node
                 node = PolicyValueNode(values, policy, actions, player, self.number_of_players, termination,
                     string_notation=child_string_notation, annotation=str(mcts_game))
-
+                    
                 # Add node to the tree
                 tree.add_node(action_index, node)
 
@@ -175,6 +180,93 @@ class MCTSSessionProcess(mp.Process):
         game_history["winner"] = game.winner
 
         self.results_queue.put(game_history)
+
+
+class PolicyNetwork(nn.Module):
+
+    def __init__(self, board_size=(6,7), num_players=2, enc_dim=2, linear_layers_dims=[64,32,16], **kwargs):
+        super(PolicyNetwork, self).__init__()
+        self.player_dim = num_players + 1
+        self.enc_dim = enc_dim
+        self.board_size = board_size
+        self.board_len = np.prod(board_size)
+
+        self.conv_filters = 16
+
+        self.player_emb = nn.Embedding(self.player_dim, self.enc_dim)
+
+        self.conv = nn.Conv2d(self.enc_dim, self.conv_filters, (4, 4))
+
+        dim = (self.board_size[0] - 3) * (self.board_size[1] -3) * self.conv_filters + self.enc_dim
+        
+        self.linear_layers = []
+        for layer_dim in linear_layers_dims:
+            linear_layer = torch.nn.Linear(dim, layer_dim)
+            self.linear_layers.append(linear_layer)
+            dim = layer_dim
+        self.linear_layers = nn.ModuleList(self.linear_layers)
+        self.output_layer = torch.nn.Linear(dim, self.board_size[1])
+
+    def forward(self, boards, turn_players):
+        batch_size = boards.shape[0]
+
+        boards = self.player_emb(boards)
+        boards = F.relu(self.conv(boards.permute(0, 3, 1, 2)))
+        boards = boards.reshape(batch_size, -1)
+
+        turn_players = turn_players.view(batch_size, 1)
+        turn_players = self.player_emb(turn_players)
+        turn_players = turn_players.view(batch_size, -1)
+
+        x = torch.concat((boards, turn_players),axis=-1)
+        
+        for linear_layer in self.linear_layers:
+            x = F.relu(linear_layer(x))
+
+        return self.output_layer(x)
+
+
+class ValueNetwork(nn.Module):
+
+    def __init__(self, board_size=(6,7), num_players=2, enc_dim=2, linear_layers_dims=[64,32,16], **kwargs):
+        super(ValueNetwork, self).__init__()
+        self.player_dim = num_players + 1
+        self.enc_dim = enc_dim
+        self.board_size = board_size
+        self.board_len = np.prod(board_size)
+
+        self.conv_filters = 16
+
+        self.player_emb = nn.Embedding(self.player_dim, self.enc_dim)
+
+        self.conv = nn.Conv2d(self.enc_dim, self.conv_filters, (4, 4))
+
+        dim = (self.board_size[0] - 3) * (self.board_size[1] -3) * self.conv_filters + self.enc_dim
+        self.linear_layers = []
+        for layer_dim in linear_layers_dims:
+            linear_layer = torch.nn.Linear(dim, layer_dim)
+            self.linear_layers.append(linear_layer)
+            dim = layer_dim
+        self.linear_layers = nn.ModuleList(self.linear_layers)
+        self.output_layer = torch.nn.Linear(dim, num_players)
+
+    def forward(self, boards, turn_players):
+        batch_size = boards.shape[0]
+
+        boards = self.player_emb(boards)
+        boards = F.relu(self.conv(boards.permute(0, 3, 1, 2)))
+        boards = boards.reshape(batch_size, -1)
+
+        turn_players = turn_players.view(batch_size, 1)
+        turn_players = self.player_emb(turn_players)
+        turn_players = turn_players.view(batch_size, -1)
+
+        x = torch.concat((boards, turn_players),axis=-1)
+
+        for linear_layer in self.linear_layers:
+            x = F.relu(linear_layer(x))
+
+        return self.output_layer(x)
 
 
 def policy_networks_play(policy_networks, number_of_games=100):
@@ -240,12 +332,10 @@ def value_networks_play(value_networks, number_of_games=100):
 
 if __name__ == "__main__":
 
-    # tf.compat.v1.disable_eager_execution()
-
     size = (6, 7)                           # height and width of board
     number_of_players = 2                   # The number of players
     n_descent = 100                         # How many path are taking during a MCTS
-    number_of_epochs = 1                  # The number of epochs
+    number_of_epochs = 1#_000_000                  # The number of epochs
     number_of_games_per_epoch = 10         # The minimal number of samples per epoch
     number_of_train_samples_per_game = 5    # The number of random training samples per game
     number_of_processes = 16                # Number of parallel processes
@@ -254,71 +344,29 @@ if __name__ == "__main__":
     l2 = 1e-4
     init_temperature = 6
 
-    physical_devices = tf.config.list_physical_devices('GPU')
-    # try:
-    #     tf.config.experimental.set_memory_growth(physical_devices[0], True)
-    # except:
-    #     pass
-
     batch_size = np.min((batch_size, number_of_processes))
 
-    policy_load_weights = None # "weights/connect_n_policy_network.h5"
-    value_load_weights = None #"weights/connect_n_value_network.h5"
+    policy_load_weights = "weights/connect_n_policy_network.h5"
+    value_load_weights = "weights/connect_n_value_network.h5"
 
     policy_save_weights = "weights/connect_n_policy_network.h5"
     value_save_weights = "weights/connect_n_value_network.h5"
 
-    number_of_actions = size[1]
+    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
-    # Shared
-    board_input = Input(size)
-    player_input = Input((1,))
+    policy_network = PolicyNetwork()
+    if policy_load_weights != None:
+        policy_network.load_state_dict(torch.load(policy_load_weights))
+    policy_network.to(device)
+    policy_loss = torch.nn.CrossEntropyLoss()
+    policy_optimizer = torch.optim.Adam(policy_network.parameters(), lr=1e-4)
 
-    # Create policy network
-    b = Embedding(3,2)(board_input)
-    b = Conv2D(16, (5,5),
-        padding="same", 
-        activation="relu",
-        activity_regularizer=tf.keras.regularizers.L2(l2))(b)
-    b = Flatten()(b)
-    b = concatenate((b, Flatten()(Embedding(2,2)(player_input))))
-    p = Dense(64, 
-        activation="relu",
-        activity_regularizer=tf.keras.regularizers.L2(l2))(b)
-    p = Dense(32, 
-        activation="relu",
-        activity_regularizer=tf.keras.regularizers.L2(l2))(p)
-    p = Dense(16, 
-        activation="relu",
-        activity_regularizer=tf.keras.regularizers.L2(l2))(p)
-    p = Dense(number_of_actions, activation="softmax")(p)
-    policy_network = Model((board_input, player_input), p )
-    policy_network.compile(loss="binary_crossentropy", optimizer="adam")
-    if policy_load_weights:
-        policy_network.load_weights(policy_load_weights)
-
-    # Create value network
-    b = Embedding(3,2)(board_input)
-    b = Conv2D(16, (5,5),
-        padding="same", 
-        activation="relu",
-        activity_regularizer=tf.keras.regularizers.L2(l2))(b)
-    b = Flatten()(b)
-    b = concatenate((b, Flatten()(Embedding(2,2)(player_input))))
-    v = Dense(64, 
-        activation="relu",
-        activity_regularizer=tf.keras.regularizers.L2(l2))(b)
-    v = Dense(32, 
-        activation="relu",
-        activity_regularizer=tf.keras.regularizers.L2(l2))(v)
-    v = Dense(16, 
-        activation="relu",
-        activity_regularizer=tf.keras.regularizers.L2(l2))(v)
-    v = Dense(number_of_players)(v)
-    value_network = Model((board_input, player_input), v)
-    value_network.compile(loss="mse", optimizer="adam")
-    if value_load_weights:
-        value_network.load_weights(value_load_weights)
+    value_network = ValueNetwork()
+    if value_load_weights != None:
+        value_network.load_state_dict(torch.load(value_load_weights))
+    value_network.to(device)
+    value_loss = torch.nn.MSELoss()
+    value_optimizer = torch.optim.Adam(value_network.parameters(), lr=1e-4)
 
     manager = mp.Manager()
 
@@ -377,19 +425,21 @@ if __name__ == "__main__":
                         players[index] = player
                         mctses.append(mcts_process)
                         del waiting_mcts[mcts_process] # Remove the mcts from waiting list
-                    inputs = (boards, players)
+                    inputs = (torch.tensor(boards, dtype=int).to(device), torch.tensor(players, dtype=int).to(device))
                     # Run the inputs through the network
-                    policies = policy_network.predict(inputs)
+                    with torch.no_grad():
+                        out = policy_network(*inputs)
+                    policies = torch.softmax(out, dim=-1).cpu().numpy()
                     # print(b)
-                    values = value_network.predict(inputs)
+                    with torch.no_grad():
+                        values = value_network(*inputs)
+                    values = values.cpu().numpy()
                     # Return the responses to the processes
                     for mcts_process, policy, value in zip(mctses, policies, values):
                         mcts_process.response_queue.put((policy, value))
 
         # print(game_histories[0])
-
         for game_history in game_histories:
-
             # Create the target values
             if game_history["winner"] == -1:
                 zs = np.zeros(number_of_players)
@@ -431,17 +481,60 @@ if __name__ == "__main__":
 
         # Train
         print("Train")
-        inputs = (np.array(train_boards), np.array(train_current_players))
+        dataset = torch.utils.data.TensorDataset(
+            torch.tensor(train_boards, dtype=int), 
+            torch.tensor(train_current_players, dtype=int),
+            torch.tensor(np.array(train_policies), dtype=torch.float32),
+            torch.tensor(np.array(train_values), dtype=torch.float32))
 
+        loader = torch.utils.data.DataLoader(dataset, batch_size=32, 
+                    pin_memory=True)
+                    
         # Policy network
-        current_policy_network = tf.keras.models.clone_model(policy_network)
+        current_policy_network = PolicyNetwork()
+        current_policy_network.load_state_dict(policy_network.state_dict())
 
-        # Train the network
-        # for i in range(len(train_values)):
-        #     print(inputs[0][i])
-        #     print(inputs[1][i])
-        #     print(train_policies[i])
-        policy_network.fit(inputs, np.array(train_policies))
+        # Value network
+        # current_value_network = value_network
+        current_value_network = ValueNetwork()
+        current_value_network.load_state_dict(value_network.state_dict())
+
+        for boards, train_current_players, train_policies, train_values in loader:
+
+            inputs = (boards.to(device), train_current_players.to(device))
+            train_policies = train_policies.to(device)
+            train_values = train_values.to(device)
+
+            # Train the network
+            # for i in range(len(train_values)):
+            #     print(inputs[0][i])
+            #     print(inputs[1][i])
+            #     print(train_policies[i])
+            policy_optimizer.zero_grad()
+            policy_logits = policy_network(*inputs)
+            policy_losses = policy_loss(policy_logits, train_policies)
+            policy_losses.backward()
+            policy_optimizer.step()
+
+            for p, t in zip(torch.softmax(policy_logits[:10], dim=-1), train_policies[:10]):
+                print("p", p)
+                print("t", t)
+
+            # Train the network
+            # for i in range(len(train_values)):
+            #     print(inputs[0][i])
+            #     print(inputs[1][i])
+            #     print(train_values[i])
+
+            value_optimizer.zero_grad()
+            value_logits = value_network(*inputs)
+            value_losses = value_loss(value_logits, train_values)
+            value_losses.backward()
+            value_optimizer.step()
+
+            # for p, t in zip(value_logits[:10], train_values[:10]):
+            #     print("p", p)
+            #     print("t", t)
 
         # Testing model against it's previous self
         # policy_play_results = policy_networks_play(policy_networks=(policy_network, current_policy_network))
@@ -452,21 +545,11 @@ if __name__ == "__main__":
         # Save or keep
         if new_policy_win_rate < 0.45:
             print("Keep policy weights")
-            policy_network.set_weights(current_policy_network.get_weights())
+            policy_network.load_state_dict(current_policy_network.state_dict())
         else:
             # Save the weights
             print("Save policy network")
-            policy_network.save_weights(policy_save_weights)
-
-        # Value network
-        current_value_network = tf.keras.models.clone_model(value_network)
-
-        # Train the network
-        for i in range(len(train_values)):
-            print(inputs[0][i])
-            print(inputs[1][i])
-            print(train_values[i])
-        value_network.fit(inputs, np.array(train_values))
+            torch.save(policy_network.state_dict(), policy_save_weights)
 
         # Testing model against it's previous self
         # value_play_results = value_networks_play((value_network, value_network))
@@ -477,11 +560,11 @@ if __name__ == "__main__":
         # Save or keep
         if new_value_win_rate < 0.45:
             print("Keep value weights")
-            value_network.set_weights(current_value_network.get_weights())
+            value_network.load_state_dict(current_value_network.state_dict())
         else:
             # Save the weights
             print("Save value network")
-            value_network.save_weights(value_save_weights)
+            torch.save(value_network.state_dict(), value_save_weights)
 
     print("Done")
     for mcts_process in mcts_processes:
